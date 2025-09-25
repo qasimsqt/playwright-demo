@@ -1,0 +1,134 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  RESOURCE_GROUP: my-playwright-rg
+  LOCATION: eastus
+  ACR_NAME: myPlaywrightACR        # change to your ACR name (lowercase)
+  IMAGE_NAME: playwright-tests
+  IMAGE_TAG: latest
+  ACI_NAME: playwright-aci-run
+  STORAGE_ACCOUNT: playwritestoracct  # choose unique name
+  FILE_SHARE: testresults
+  FILE_DOWNLOAD_DIR: $(Build.ArtifactStagingDirectory)/test-results
+  AZURE_SERVICE_CONNECTION: 'AzureServiceConnection' # change to your service connection name
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+# 1) Build and push Docker image to ACR
+- task: Docker@2
+  displayName: Build and push image to ACR
+  inputs:
+    command: buildAndPush
+    repository: $(ACR_NAME).azurecr.io/$(IMAGE_NAME)
+    dockerfile: Dockerfile
+    tags: |
+      $(IMAGE_TAG)
+    containerRegistry: $(AZURE_SERVICE_CONNECTION) # you can use Docker registry service connection
+
+# 2) Create resource group & storage account & file share (idempotent)
+- task: AzureCLI@2
+  displayName: Ensure RG / Storage Account / File Share exist
+  inputs:
+    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -e
+      az group create -n $(RESOURCE_GROUP) -l $(LOCATION)
+      az storage account create -n $(STORAGE_ACCOUNT) -g $(RESOURCE_GROUP) -l $(LOCATION) --sku Standard_LRS --https-only true || true
+      # create file share
+      STORAGE_KEY=$(az storage account keys list -g $(RESOURCE_GROUP) -n $(STORAGE_ACCOUNT) --query "[0].value" -o tsv)
+      az storage share create --name $(FILE_SHARE) --account-name $(STORAGE_ACCOUNT) --account-key "$STORAGE_KEY" || true
+      echo "Storage key set in pipeline output"
+      echo "##vso[task.setvariable variable=STORAGE_KEY;issecret=true]$STORAGE_KEY"
+
+# 3) Get ACR credentials (username/password)
+- task: AzureCLI@2
+  displayName: Get ACR creds
+  inputs:
+    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      ACR_LOGIN_SERVER="$(az acr show -n $(ACR_NAME) --query loginServer -o tsv)"
+      ACR_USER="$(az acr credential show -n $(ACR_NAME) --query username -o tsv)"
+      ACR_PSW="$(az acr credential show -n $(ACR_NAME) --query 'passwords[0].value' -o tsv)"
+      echo "##vso[task.setvariable variable=ACR_LOGIN_SERVER]$ACR_LOGIN_SERVER"
+      echo "##vso[task.setvariable variable=ACR_USER]$ACR_USER"
+      echo "##vso[task.setvariable variable=ACR_PSW;issecret=true]$ACR_PSW"
+
+# 4) Deploy the container to ACI (mount Azure File Share at /results)
+- task: AzureCLI@2
+  displayName: Run container in ACI (one-off)
+  inputs:
+    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -e
+      echo "Deploying ACI container..."
+      ACI_CHECK=$(az container show -g $(RESOURCE_GROUP) -n $(ACI_NAME) --query "provisioningState" -o tsv 2>/dev/null || true)
+      if [ "$ACI_CHECK" == "Succeeded" ] || [ "$ACI_CHECK" == "Creating" ]; then
+        echo "ACI already exists. Deleting first..."
+        az container delete -g $(RESOURCE_GROUP) -n $(ACI_NAME) -y || true
+      fi
+
+      az container create \
+        --resource-group $(RESOURCE_GROUP) \
+        --name $(ACI_NAME) \
+        --image $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(IMAGE_TAG) \
+        --cpu 2 --memory 4 \
+        --registry-login-server $(ACR_LOGIN_SERVER) \
+        --registry-username $(ACR_USER) \
+        --registry-password $(ACR_PSW) \
+        --restart-policy Never \
+        --azure-file-volume-share-name $(FILE_SHARE) \
+        --azure-file-volume-account-name $(STORAGE_ACCOUNT) \
+        --azure-file-volume-account-key $(STORAGE_KEY) \
+        --azure-file-volume-mount-path /results \
+        --environment-variables "RESULTS_DIR=/results"
+
+      echo "Waiting for container to exit..."
+      # wait until instanceView.state becomes Terminated or Failed
+      while true; do
+        STATE=$(az container show -g $(RESOURCE_GROUP) -n $(ACI_NAME) --query "instanceView.state" -o tsv)
+        echo "Container state: $STATE"
+        if [[ "$STATE" == "Terminated" || "$STATE" == "Failed" || -z "$STATE" ]]; then
+          break
+        fi
+        sleep 5
+      done
+
+      # show logs
+      echo "Container logs:"
+      az container logs -g $(RESOURCE_GROUP) -n $(ACI_NAME) --follow || true
+
+# 5) Download files from Azure File Share into agent and publish
+- task: AzureCLI@2
+  displayName: Download results from file share and publish
+  inputs:
+    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -e
+      mkdir -p "$(Build.ArtifactStagingDirectory)/test-results"
+      echo "Downloading files from file share to pipeline agent..."
+      az storage file download-batch \
+        --source $(FILE_SHARE) \
+        --destination "$(Build.ArtifactStagingDirectory)/test-results" \
+        --account-name $(STORAGE_ACCOUNT) \
+        --account-key $(STORAGE_KEY)
+      ls -la "$(Build.ArtifactStagingDirectory)/test-results" || true
+
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)/test-results'
+    artifact: 'playwright-results'
+    publishLocation: 'pipeline'
